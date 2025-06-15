@@ -1,341 +1,373 @@
+import { eq, and, desc, gte, lte, like, sql } from 'drizzle-orm';
 import { databaseService } from '@/services/databaseService';
-import { logger } from '@/utils/logger';
+import { logger, auditLogger } from '@/utils/logger';
 import * as masterSchema from '@/database/schemas/master.schema';
-import type { AuditEvent, NewAuditLog } from '@/types/database.types';
+import { config } from '@/config/environment';
 
 /**
  * Audit Service
- * Handles audit logging for security, compliance, and debugging
- * Tracks all user actions and system events
+ * Handles comprehensive audit logging for security, compliance, and monitoring
  */
+
+interface AuditEntry {
+  user_id?: string;
+  action: string;
+  resource_type: string;
+  resource_id?: string;
+  ip_address?: string;
+  user_agent?: string;
+  details?: Record<string, any>;
+  severity: 'low' | 'medium' | 'high' | 'critical';
+  category: 'auth' | 'data' | 'system' | 'security' | 'api' | 'file';
+}
+
+interface AuthAuditEntry {
+  user_id?: string;
+  action: 'login' | 'logout' | 'register' | 'password_change' | 'password_reset' | 'token_refresh' | 'failed_login' | 'account_locked';
+  ip_address?: string;
+  user_agent?: string;
+  details?: Record<string, any>;
+}
+
+interface ConversationAuditEntry {
+  user_id: string;
+  action: 'create' | 'update' | 'delete' | 'message_sent' | 'message_received' | 'export';
+  conversation_id?: string;
+  project_id?: string;
+  message_id?: string;
+  tokens_used?: number;
+  ip_address?: string;
+  user_agent?: string;
+}
+
+interface DataAuditEntry {
+  user_id: string;
+  action: 'create' | 'read' | 'update' | 'delete' | 'export' | 'import' | 'backup' | 'restore';
+  table_name: string;
+  record_id?: string;
+  field_changes?: Record<string, { old: any; new: any }>;
+  ip_address?: string;
+  user_agent?: string;
+}
+
+interface SystemAuditEntry {
+  action: 'startup' | 'shutdown' | 'migration' | 'backup' | 'maintenance' | 'error' | 'performance_alert';
+  component: string;
+  details?: Record<string, any>;
+  severity: 'info' | 'warning' | 'error' | 'critical';
+}
+
+interface SecurityAuditEntry {
+  user_id?: string;
+  action: 'suspicious_activity' | 'rate_limit_exceeded' | 'unauthorized_access' | 'malicious_request' | 'security_scan';
+  threat_type?: string;
+  ip_address?: string;
+  user_agent?: string;
+  details?: Record<string, any>;
+}
+
+interface AuditQuery {
+  user_id?: string;
+  action?: string;
+  resource_type?: string;
+  category?: string;
+  severity?: string;
+  date_from?: string;
+  date_to?: string;
+  ip_address?: string;
+  limit?: number;
+  offset?: number;
+}
+
 class AuditService {
-  private batchSize = 100;
-  private flushInterval = 30000; // 30 seconds
-  private auditQueue: NewAuditLog[] = [];
-  private flushTimer: NodeJS.Timeout | null = null;
-  private isEnabled = true;
+  private batchEntries: AuditEntry[] = [];
+  private batchInterval: NodeJS.Timeout | null = null;
+  private readonly BATCH_SIZE = 100;
+  private readonly BATCH_INTERVAL = 5000; // 5 seconds
 
   constructor() {
     this.startBatchProcessor();
+    logger.info('Audit service initialized');
   }
 
   /**
-   * Log an audit event
-   * @param event - Audit event data
+   * Start batch processing for audit entries
    */
-  async log(event: AuditEvent): Promise<void> {
-    if (!this.isEnabled) {
-      return;
-    }
-
-    try {
-      const auditLog: NewAuditLog = {
-        user_id: event.user_id || null,
-        action: event.action,
-        resource_type: event.resource_type,
-        resource_id: event.resource_id || null,
-        details: event.details || {},
-        ip_address: event.ip_address || null,
-        user_agent: event.user_agent || null,
-        created_at: new Date(),
-      };
-
-      // Add to batch queue
-      this.auditQueue.push(auditLog);
-
-      // Force flush if queue is full
-      if (this.auditQueue.length >= this.batchSize) {
+  private startBatchProcessor(): void {
+    this.batchInterval = setInterval(async () => {
+      if (this.batchEntries.length > 0) {
         await this.flushBatch();
       }
+    }, this.BATCH_INTERVAL);
+  }
 
-      logger.debug('Audit event queued:', {
-        action: event.action,
-        resource: event.resource_type,
-        user: event.user_id,
-      });
+  /**
+   * Generic audit logging
+   */
+  async logAudit(entry: AuditEntry): Promise<void> {
+    try {
+      const auditEntry = {
+        ...entry,
+        timestamp: new Date(),
+        session_id: this.generateSessionId(),
+      };
+
+      // Add to batch
+      this.batchEntries.push(auditEntry);
+
+      // Log to file immediately for critical entries
+      if (entry.severity === 'critical') {
+        auditLogger.error('Critical audit event', auditEntry);
+        await this.flushBatch(); // Immediate flush for critical events
+      } else if (entry.severity === 'high') {
+        auditLogger.warn('High severity audit event', auditEntry);
+      }
+
+      // Flush batch if it's full
+      if (this.batchEntries.length >= this.BATCH_SIZE) {
+        await this.flushBatch();
+      }
     } catch (error) {
-      logger.error('Failed to queue audit event:', error);
+      logger.error('Failed to log audit entry:', error);
     }
   }
 
   /**
-   * Log user authentication events
+   * Authentication audit logging
    */
-  async logAuth(event: {
-    user_id?: string;
-    action: 'login' | 'logout' | 'register' | 'password_change' | 'token_refresh';
-    success: boolean;
-    ip_address?: string;
-    user_agent?: string;
-    details?: any;
-  }): Promise<void> {
-    await this.log({
-      user_id: event.user_id,
-      action: `auth_${event.action}`,
-      resource_type: 'user_session',
-      details: {
-        success: event.success,
-        ...event.details,
-      },
-      ip_address: event.ip_address,
-      user_agent: event.user_agent,
-    });
-  }
-
-  /**
-   * Log project-related events
-   */
-  async logProject(event: {
-    user_id: string;
-    action: 'create' | 'update' | 'delete' | 'archive' | 'restore';
-    project_id: string;
-    changes?: any;
-    ip_address?: string;
-    user_agent?: string;
-  }): Promise<void> {
-    await this.log({
-      user_id: event.user_id,
-      action: `project_${event.action}`,
-      resource_type: 'project',
-      resource_id: event.project_id,
-      details: {
-        changes: event.changes,
-      },
-      ip_address: event.ip_address,
-      user_agent: event.user_agent,
-    });
-  }
-
-  /**
-   * Log conversation events
-   */
-  async logConversation(event: {
-    user_id: string;
-    action: 'create' | 'update' | 'delete' | 'archive' | 'message_sent';
-    conversation_id: string;
-    project_id?: string;
-    message_count?: number;
-    tokens_used?: number;
-    ip_address?: string;
-    user_agent?: string;
-  }): Promise<void> {
-    await this.log({
-      user_id: event.user_id,
-      action: `conversation_${event.action}`,
-      resource_type: 'conversation',
-      resource_id: event.conversation_id,
-      details: {
-        project_id: event.project_id,
-        message_count: event.message_count,
-        tokens_used: event.tokens_used,
-      },
-      ip_address: event.ip_address,
-      user_agent: event.user_agent,
-    });
-  }
-
-  /**
-   * Log database operations
-   */
-  async logDatabase(event: {
-    user_id: string;
-    action: 'create' | 'update' | 'delete' | 'connect' | 'disconnect' | 'test';
-    database_id?: string;
-    database_type?: string;
-    success: boolean;
-    ip_address?: string;
-    user_agent?: string;
-    error?: string;
-  }): Promise<void> {
-    await this.log({
-      user_id: event.user_id,
-      action: `database_${event.action}`,
-      resource_type: 'user_database',
-      resource_id: event.database_id,
-      details: {
-        database_type: event.database_type,
-        success: event.success,
-        error: event.error,
-      },
-      ip_address: event.ip_address,
-      user_agent: event.user_agent,
-    });
-  }
-
-  /**
-   * Log export/import operations
-   */
-  async logExport(event: {
-    user_id: string;
-    action: 'export_create' | 'export_download' | 'import_create' | 'import_complete';
-    job_id: string;
-    format?: string;
-    file_size?: number;
-    records_count?: number;
-    ip_address?: string;
-    user_agent?: string;
-  }): Promise<void> {
-    await this.log({
-      user_id: event.user_id,
-      action: event.action,
-      resource_type: 'export_job',
-      resource_id: event.job_id,
-      details: {
-        format: event.format,
-        file_size: event.file_size,
-        records_count: event.records_count,
-      },
-      ip_address: event.ip_address,
-      user_agent: event.user_agent,
-    });
-  }
-
-  /**
-   * Log security events
-   */
-  async logSecurity(event: {
-    user_id?: string;
-    action: 'suspicious_activity' | 'rate_limit_exceeded' | 'unauthorized_access' | 'data_breach_attempt';
-    severity: 'low' | 'medium' | 'high' | 'critical';
-    description: string;
-    ip_address?: string;
-    user_agent?: string;
-    details?: any;
-  }): Promise<void> {
-    await this.log({
-      user_id: event.user_id,
-      action: `security_${event.action}`,
-      resource_type: 'security_event',
-      details: {
-        severity: event.severity,
-        description: event.description,
-        ...event.details,
-      },
-      ip_address: event.ip_address,
-      user_agent: event.user_agent,
+  async logAuth(entry: AuthAuditEntry): Promise<void> {
+    const severity = this.getAuthSeverity(entry.action);
+    
+    await this.logAudit({
+      user_id: entry.user_id,
+      action: entry.action,
+      resource_type: 'user',
+      ip_address: entry.ip_address,
+      user_agent: entry.user_agent,
+      details: entry.details,
+      severity,
+      category: 'auth',
     });
 
-    // Log high severity events immediately
-    if (event.severity === 'high' || event.severity === 'critical') {
-      await this.flushBatch();
-      logger.warn(`Security event [${event.severity}]:`, {
-        action: event.action,
-        user: event.user_id,
-        description: event.description,
-        ip: event.ip_address,
+    // Additional logging for security events
+    if (['failed_login', 'account_locked'].includes(entry.action)) {
+      await this.logSecurity({
+        user_id: entry.user_id,
+        action: 'suspicious_activity',
+        threat_type: entry.action,
+        ip_address: entry.ip_address,
+        user_agent: entry.user_agent,
+        details: entry.details,
       });
     }
   }
 
   /**
-   * Log admin operations
+   * Conversation audit logging
    */
-  async logAdmin(event: {
-    user_id: string;
-    action: string;
-    target_user_id?: string;
-    resource_type: string;
-    resource_id?: string;
-    changes?: any;
-    ip_address?: string;
-    user_agent?: string;
-  }): Promise<void> {
-    await this.log({
-      user_id: event.user_id,
-      action: `admin_${event.action}`,
-      resource_type: event.resource_type,
-      resource_id: event.resource_id,
+  async logConversation(entry: ConversationAuditEntry): Promise<void> {
+    await this.logAudit({
+      user_id: entry.user_id,
+      action: entry.action,
+      resource_type: 'conversation',
+      resource_id: entry.conversation_id,
+      ip_address: entry.ip_address,
+      user_agent: entry.user_agent,
       details: {
-        target_user_id: event.target_user_id,
-        changes: event.changes,
-        admin_operation: true,
+        project_id: entry.project_id,
+        message_id: entry.message_id,
+        tokens_used: entry.tokens_used,
       },
-      ip_address: event.ip_address,
-      user_agent: event.user_agent,
+      severity: 'low',
+      category: 'data',
     });
-
-    // Always flush admin operations immediately
-    await this.flushBatch();
   }
 
   /**
-   * Get audit logs with filtering
+   * Data operation audit logging
    */
-  async getAuditLogs(filters: {
-    user_id?: string;
-    action?: string;
-    resource_type?: string;
-    resource_id?: string;
-    date_from?: Date;
-    date_to?: Date;
-    limit?: number;
-    offset?: number;
-  } = {}): Promise<{
+  async logData(entry: DataAuditEntry): Promise<void> {
+    const severity = ['delete', 'export'].includes(entry.action) ? 'medium' : 'low';
+
+    await this.logAudit({
+      user_id: entry.user_id,
+      action: entry.action,
+      resource_type: entry.table_name,
+      resource_id: entry.record_id,
+      ip_address: entry.ip_address,
+      user_agent: entry.user_agent,
+      details: {
+        field_changes: entry.field_changes,
+      },
+      severity,
+      category: 'data',
+    });
+  }
+
+  /**
+   * System event audit logging
+   */
+  async logSystem(entry: SystemAuditEntry): Promise<void> {
+    const severity = this.mapSystemSeverity(entry.severity);
+
+    await this.logAudit({
+      action: entry.action,
+      resource_type: 'system',
+      resource_id: entry.component,
+      details: entry.details,
+      severity,
+      category: 'system',
+    });
+  }
+
+  /**
+   * Security event audit logging
+   */
+  async logSecurity(entry: SecurityAuditEntry): Promise<void> {
+    await this.logAudit({
+      user_id: entry.user_id,
+      action: entry.action,
+      resource_type: 'security',
+      ip_address: entry.ip_address,
+      user_agent: entry.user_agent,
+      details: {
+        threat_type: entry.threat_type,
+        ...entry.details,
+      },
+      severity: 'high',
+      category: 'security',
+    });
+
+    // Log to security logger
+    logger.logSecurityEvent(entry.action, {
+      user_id: entry.user_id,
+      threat_type: entry.threat_type,
+      ip_address: entry.ip_address,
+      details: entry.details,
+    });
+  }
+
+  /**
+   * File operation audit logging
+   */
+  async logFile(
+    user_id: string,
+    action: 'upload' | 'download' | 'delete',
+    filename: string,
+    size?: number,
+    ip_address?: string
+  ): Promise<void> {
+    await this.logAudit({
+      user_id,
+      action,
+      resource_type: 'file',
+      resource_id: filename,
+      ip_address,
+      details: { size },
+      severity: 'low',
+      category: 'file',
+    });
+  }
+
+  /**
+   * API request audit logging
+   */
+  async logApi(
+    user_id: string | undefined,
+    method: string,
+    endpoint: string,
+    status_code: number,
+    ip_address?: string,
+    user_agent?: string,
+    response_time?: number
+  ): Promise<void> {
+    const severity = status_code >= 500 ? 'high' : status_code >= 400 ? 'medium' : 'low';
+
+    await this.logAudit({
+      user_id,
+      action: `${method} ${endpoint}`,
+      resource_type: 'api',
+      ip_address,
+      user_agent,
+      details: {
+        method,
+        endpoint,
+        status_code,
+        response_time,
+      },
+      severity,
+      category: 'api',
+    });
+  }
+
+  /**
+   * Query audit logs
+   */
+  async queryAuditLogs(query: AuditQuery): Promise<{
     logs: any[];
     total: number;
+    page: number;
+    totalPages: number;
   }> {
     try {
       const masterDb = databaseService.getMasterDb();
-      
-      let query = masterDb.select().from(masterSchema.auditLogs);
-      let countQuery = masterDb.select({ count: masterSchema.auditLogs.id }).from(masterSchema.auditLogs);
+      const limit = Math.min(query.limit || 50, 1000);
+      const offset = query.offset || 0;
 
-      // Apply filters
-      const conditions: any[] = [];
+      // Build where conditions
+      const conditions = [];
 
-      if (filters.user_id) {
-        conditions.push(`user_id = '${filters.user_id}'`);
+      if (query.user_id) {
+        conditions.push(eq(masterSchema.auditLogs.user_id, query.user_id));
+      }
+      if (query.action) {
+        conditions.push(like(masterSchema.auditLogs.action, `%${query.action}%`));
+      }
+      if (query.resource_type) {
+        conditions.push(eq(masterSchema.auditLogs.resource_type, query.resource_type));
+      }
+      if (query.category) {
+        conditions.push(eq(masterSchema.auditLogs.category, query.category));
+      }
+      if (query.severity) {
+        conditions.push(eq(masterSchema.auditLogs.severity, query.severity));
+      }
+      if (query.ip_address) {
+        conditions.push(eq(masterSchema.auditLogs.ip_address, query.ip_address));
+      }
+      if (query.date_from) {
+        conditions.push(gte(masterSchema.auditLogs.timestamp, new Date(query.date_from)));
+      }
+      if (query.date_to) {
+        conditions.push(lte(masterSchema.auditLogs.timestamp, new Date(query.date_to)));
       }
 
-      if (filters.action) {
-        conditions.push(`action = '${filters.action}'`);
-      }
+      // Get total count
+      const [{ count }] = await masterDb
+        .select({ count: sql<number>`cast(count(*) as int)` })
+        .from(masterSchema.auditLogs)
+        .where(conditions.length > 0 ? and(...conditions) : undefined);
 
-      if (filters.resource_type) {
-        conditions.push(`resource_type = '${filters.resource_type}'`);
-      }
+      // Get logs with pagination
+      const logs = await masterDb
+        .select()
+        .from(masterSchema.auditLogs)
+        .where(conditions.length > 0 ? and(...conditions) : undefined)
+        .orderBy(desc(masterSchema.auditLogs.timestamp))
+        .limit(limit)
+        .offset(offset);
 
-      if (filters.resource_id) {
-        conditions.push(`resource_id = '${filters.resource_id}'`);
-      }
-
-      if (filters.date_from) {
-        conditions.push(`created_at >= '${filters.date_from.toISOString()}'`);
-      }
-
-      if (filters.date_to) {
-        conditions.push(`created_at <= '${filters.date_to.toISOString()}'`);
-      }
-
-      // Build WHERE clause
-      if (conditions.length > 0) {
-        const whereClause = conditions.join(' AND ');
-        query = query.where(whereClause as any);
-        countQuery = countQuery.where(whereClause as any);
-      }
-
-      // Apply ordering
-      query = query.orderBy(masterSchema.auditLogs.created_at, 'desc');
-
-      // Apply pagination
-      if (filters.limit) {
-        query = query.limit(filters.limit);
-      }
-      if (filters.offset) {
-        query = query.offset(filters.offset);
-      }
-
-      const [logs, [{ count }]] = await Promise.all([
-        query,
-        countQuery
-      ]);
+      const totalPages = Math.ceil(count / limit);
+      const page = Math.floor(offset / limit) + 1;
 
       return {
         logs,
-        total: Array.isArray(count) ? count.length : Number(count) || 0,
+        total: count,
+        page,
+        totalPages,
       };
     } catch (error) {
-      logger.error('Failed to get audit logs:', error);
+      logger.error('Failed to query audit logs:', error);
       throw error;
     }
   }
@@ -343,269 +375,517 @@ class AuditService {
   /**
    * Get audit statistics
    */
-  async getAuditStats(period: '24h' | '7d' | '30d' = '24h'): Promise<{
-    total_events: number;
-    events_by_action: Record<string, number>;
-    events_by_resource: Record<string, number>;
-    unique_users: number;
-    timeline: Array<{
-      date: string;
+  async getStatistics(timeframe: 'day' | 'week' | 'month' = 'day'): Promise<{
+    totalEvents: number;
+    eventsByCategory: Record<string, number>;
+    eventsBySeverity: Record<string, number>;
+    topUsers: Array<{ user_id: string; count: number }>;
+    topActions: Array<{ action: string; count: number }>;
+    timeline: Array<{ date: string; count: number }>;
+  }> {
+    try {
+      const masterDb = databaseService.getMasterDb();
+      const timeframeHours = { day: 24, week: 168, month: 720 }[timeframe];
+      const since = new Date(Date.now() - timeframeHours * 60 * 60 * 1000);
+
+      // Total events
+      const [{ totalEvents }] = await masterDb
+        .select({ totalEvents: sql<number>`cast(count(*) as int)` })
+        .from(masterSchema.auditLogs)
+        .where(gte(masterSchema.auditLogs.timestamp, since));
+
+      // Events by category
+      const categoryStats = await masterDb
+        .select({
+          category: masterSchema.auditLogs.category,
+          count: sql<number>`cast(count(*) as int)`,
+        })
+        .from(masterSchema.auditLogs)
+        .where(gte(masterSchema.auditLogs.timestamp, since))
+        .groupBy(masterSchema.auditLogs.category);
+
+      const eventsByCategory = categoryStats.reduce((acc, { category, count }) => {
+        acc[category] = count;
+        return acc;
+      }, {} as Record<string, number>);
+
+      // Events by severity
+      const severityStats = await masterDb
+        .select({
+          severity: masterSchema.auditLogs.severity,
+          count: sql<number>`cast(count(*) as int)`,
+        })
+        .from(masterSchema.auditLogs)
+        .where(gte(masterSchema.auditLogs.timestamp, since))
+        .groupBy(masterSchema.auditLogs.severity);
+
+      const eventsBySeverity = severityStats.reduce((acc, { severity, count }) => {
+        acc[severity] = count;
+        return acc;
+      }, {} as Record<string, number>);
+
+      // Top users
+      const topUsers = await masterDb
+        .select({
+          user_id: masterSchema.auditLogs.user_id,
+          count: sql<number>`cast(count(*) as int)`,
+        })
+        .from(masterSchema.auditLogs)
+        .where(
+          and(
+            gte(masterSchema.auditLogs.timestamp, since),
+            sql`user_id IS NOT NULL`
+          )
+        )
+        .groupBy(masterSchema.auditLogs.user_id)
+        .orderBy(desc(sql`count(*)`))
+        .limit(10);
+
+      // Top actions
+      const topActions = await masterDb
+        .select({
+          action: masterSchema.auditLogs.action,
+          count: sql<number>`cast(count(*) as int)`,
+        })
+        .from(masterSchema.auditLogs)
+        .where(gte(masterSchema.auditLogs.timestamp, since))
+        .groupBy(masterSchema.auditLogs.action)
+        .orderBy(desc(sql`count(*)`))
+        .limit(10);
+
+      // Timeline
+      const timelineQuery = timeframe === 'day' 
+        ? sql`DATE_TRUNC('hour', timestamp)` 
+        : sql`DATE_TRUNC('day', timestamp)`;
+
+      const timelineStats = await masterDb
+        .select({
+          date: timelineQuery,
+          count: sql<number>`cast(count(*) as int)`,
+        })
+        .from(masterSchema.auditLogs)
+        .where(gte(masterSchema.auditLogs.timestamp, since))
+        .groupBy(timelineQuery)
+        .orderBy(timelineQuery);
+
+      const timeline = timelineStats.map(({ date, count }) => ({
+        date: date.toISOString(),
+        count,
+      }));
+
+      return {
+        totalEvents,
+        eventsByCategory,
+        eventsBySeverity,
+        topUsers: topUsers.map(u => ({ user_id: u.user_id!, count: u.count })),
+        topActions,
+        timeline,
+      };
+    } catch (error) {
+      logger.error('Failed to get audit statistics:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Generate compliance report
+   */
+  async generateComplianceReport(
+    startDate: string,
+    endDate: string
+  ): Promise<{
+    period: { start: string; end: string };
+    summary: {
+      totalEvents: number;
+      securityEvents: number;
+      dataAccessEvents: number;
+      authenticationEvents: number;
+    };
+    violations: any[];
+    recommendations: string[];
+  }> {
+    try {
+      const masterDb = databaseService.getMasterDb();
+      const start = new Date(startDate);
+      const end = new Date(endDate);
+
+      // Get summary statistics
+      const [{ totalEvents }] = await masterDb
+        .select({ totalEvents: sql<number>`cast(count(*) as int)` })
+        .from(masterSchema.auditLogs)
+        .where(
+          and(
+            gte(masterSchema.auditLogs.timestamp, start),
+            lte(masterSchema.auditLogs.timestamp, end)
+          )
+        );
+
+      // Security events
+      const [{ securityEvents }] = await masterDb
+        .select({ securityEvents: sql<number>`cast(count(*) as int)` })
+        .from(masterSchema.auditLogs)
+        .where(
+          and(
+            gte(masterSchema.auditLogs.timestamp, start),
+            lte(masterSchema.auditLogs.timestamp, end),
+            eq(masterSchema.auditLogs.category, 'security')
+          )
+        );
+
+      // Data access events
+      const [{ dataAccessEvents }] = await masterDb
+        .select({ dataAccessEvents: sql<number>`cast(count(*) as int)` })
+        .from(masterSchema.auditLogs)
+        .where(
+          and(
+            gte(masterSchema.auditLogs.timestamp, start),
+            lte(masterSchema.auditLogs.timestamp, end),
+            eq(masterSchema.auditLogs.category, 'data')
+          )
+        );
+
+      // Authentication events
+      const [{ authenticationEvents }] = await masterDb
+        .select({ authenticationEvents: sql<number>`cast(count(*) as int)` })
+        .from(masterSchema.auditLogs)
+        .where(
+          and(
+            gte(masterSchema.auditLogs.timestamp, start),
+            lte(masterSchema.auditLogs.timestamp, end),
+            eq(masterSchema.auditLogs.category, 'auth')
+          )
+        );
+
+      // Find potential violations (high/critical severity events)
+      const violations = await masterDb
+        .select()
+        .from(masterSchema.auditLogs)
+        .where(
+          and(
+            gte(masterSchema.auditLogs.timestamp, start),
+            lte(masterSchema.auditLogs.timestamp, end),
+            sql`severity IN ('high', 'critical')`
+          )
+        )
+        .orderBy(desc(masterSchema.auditLogs.timestamp));
+
+      // Generate recommendations
+      const recommendations = this.generateRecommendations(violations, {
+        totalEvents,
+        securityEvents,
+        dataAccessEvents,
+        authenticationEvents,
+      });
+
+      return {
+        period: { start: startDate, end: endDate },
+        summary: {
+          totalEvents,
+          securityEvents,
+          dataAccessEvents,
+          authenticationEvents,
+        },
+        violations,
+        recommendations,
+      };
+    } catch (error) {
+      logger.error('Failed to generate compliance report:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Flush batch entries to database
+   */
+  private async flushBatch(): Promise<void> {
+    if (this.batchEntries.length === 0) return;
+
+    try {
+      const masterDb = databaseService.getMasterDb();
+      const entries = [...this.batchEntries];
+      this.batchEntries = [];
+
+      await masterDb
+        .insert(masterSchema.auditLogs)
+        .values(
+          entries.map(entry => ({
+            user_id: entry.user_id,
+            action: entry.action,
+            resource_type: entry.resource_type,
+            resource_id: entry.resource_id,
+            ip_address: entry.ip_address,
+            user_agent: entry.user_agent,
+            details: entry.details,
+            severity: entry.severity,
+            category: entry.category,
+            timestamp: new Date(),
+          }))
+        );
+
+      logger.debug(`Flushed ${entries.length} audit entries to database`);
+    } catch (error) {
+      logger.error('Failed to flush audit batch:', error);
+      // Re-add entries to batch for retry
+      this.batchEntries.unshift(...this.batchEntries);
+    }
+  }
+
+  /**
+   * Helper methods
+   */
+  private getAuthSeverity(action: string): 'low' | 'medium' | 'high' | 'critical' {
+    switch (action) {
+      case 'failed_login':
+      case 'account_locked':
+        return 'high';
+      case 'password_change':
+      case 'password_reset':
+        return 'medium';
+      default:
+        return 'low';
+    }
+  }
+
+  private mapSystemSeverity(severity: string): 'low' | 'medium' | 'high' | 'critical' {
+    switch (severity) {
+      case 'critical':
+        return 'critical';
+      case 'error':
+        return 'high';
+      case 'warning':
+        return 'medium';
+      default:
+        return 'low';
+    }
+  }
+
+  private generateSessionId(): string {
+    return `audit_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  }
+
+  private generateRecommendations(violations: any[], summary: any): string[] {
+    const recommendations: string[] = [];
+
+    // Check for high number of security events
+    if (summary.securityEvents > 50) {
+      recommendations.push('High number of security events detected. Review security policies and implement additional monitoring.');
+    }
+
+    // Check for failed login patterns
+    const failedLogins = violations.filter(v => v.action === 'failed_login');
+    if (failedLogins.length > 10) {
+      recommendations.push('Multiple failed login attempts detected. Consider implementing account lockout policies.');
+    }
+
+    // Check for suspicious IP patterns
+    const suspiciousIPs = violations
+      .filter(v => v.ip_address)
+      .reduce((acc, v) => {
+        acc[v.ip_address] = (acc[v.ip_address] || 0) + 1;
+        return acc;
+      }, {} as Record<string, number>);
+
+    const highActivityIPs = Object.entries(suspiciousIPs)
+      .filter(([, count]) => count > 5)
+      .map(([ip]) => ip);
+
+    if (highActivityIPs.length > 0) {
+      recommendations.push(`High activity from IPs: ${highActivityIPs.join(', ')}. Consider IP-based restrictions.`);
+    }
+
+    // Check for data export activities
+    const dataExports = violations.filter(v => v.action.includes('export'));
+    if (dataExports.length > 0) {
+      recommendations.push('Data export activities detected. Ensure proper authorization and data protection compliance.');
+    }
+
+    return recommendations;
+  }
+
+  /**
+   * Archive old audit logs
+   */
+  async archiveOldLogs(retentionDays: number = 365): Promise<number> {
+    try {
+      const masterDb = databaseService.getMasterDb();
+      const cutoffDate = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
+
+      // Get count of logs to be archived
+      const [{ count }] = await masterDb
+        .select({ count: sql<number>`cast(count(*) as int)` })
+        .from(masterSchema.auditLogs)
+        .where(lte(masterSchema.auditLogs.timestamp, cutoffDate));
+
+      // In production, you would move these to an archive table or external storage
+      // For now, we'll just log the operation
+      logger.info(`Would archive ${count} audit logs older than ${retentionDays} days`);
+
+      return count;
+    } catch (error) {
+      logger.error('Failed to archive old logs:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Export audit logs
+   */
+  async exportLogs(
+    query: AuditQuery,
+    format: 'json' | 'csv' = 'json'
+  ): Promise<string> {
+    try {
+      const { logs } = await this.queryAuditLogs({ ...query, limit: 10000 });
+
+      if (format === 'csv') {
+        const headers = [
+          'timestamp',
+          'user_id',
+          'action',
+          'resource_type',
+          'resource_id',
+          'ip_address',
+          'severity',
+          'category',
+        ];
+
+        const csvData = [
+          headers.join(','),
+          ...logs.map(log => [
+            log.timestamp,
+            log.user_id || '',
+            log.action,
+            log.resource_type,
+            log.resource_id || '',
+            log.ip_address || '',
+            log.severity,
+            log.category,
+          ].map(field => `"${field}"`).join(',')),
+        ].join('\n');
+
+        return csvData;
+      }
+
+      return JSON.stringify(logs, null, 2);
+    } catch (error) {
+      logger.error('Failed to export audit logs:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Real-time monitoring alerts
+   */
+  async checkSecurityAlerts(): Promise<{
+    alerts: Array<{
+      type: string;
+      severity: 'medium' | 'high' | 'critical';
+      message: string;
       count: number;
+      details: any;
     }>;
   }> {
     try {
       const masterDb = databaseService.getMasterDb();
-      
-      // Calculate date range
-      const now = new Date();
-      const periodHours = period === '24h' ? 24 : period === '7d' ? 168 : 720;
-      const startDate = new Date(now.getTime() - (periodHours * 60 * 60 * 1000));
+      const lastHour = new Date(Date.now() - 60 * 60 * 1000);
+      const alerts = [];
 
-      // Get basic stats
-      const [totalEvents] = await masterDb.execute(`
-        SELECT COUNT(*) as total
-        FROM audit_logs 
-        WHERE created_at >= $1
-      `, [startDate]);
-
-      const [uniqueUsers] = await masterDb.execute(`
-        SELECT COUNT(DISTINCT user_id) as unique_users
-        FROM audit_logs 
-        WHERE created_at >= $1 AND user_id IS NOT NULL
-      `, [startDate]);
-
-      // Get events by action
-      const eventsByAction = await masterDb.execute(`
-        SELECT action, COUNT(*) as count
-        FROM audit_logs 
-        WHERE created_at >= $1
-        GROUP BY action
-        ORDER BY count DESC
-        LIMIT 20
-      `, [startDate]);
-
-      // Get events by resource type
-      const eventsByResource = await masterDb.execute(`
-        SELECT resource_type, COUNT(*) as count
-        FROM audit_logs 
-        WHERE created_at >= $1
-        GROUP BY resource_type
-        ORDER BY count DESC
-        LIMIT 20
-      `, [startDate]);
-
-      // Get timeline
-      const timelineInterval = period === '24h' ? 'hour' : 'day';
-      const timeline = await masterDb.execute(`
-        SELECT 
-          DATE_TRUNC('${timelineInterval}', created_at) as date,
-          COUNT(*) as count
-        FROM audit_logs 
-        WHERE created_at >= $1
-        GROUP BY DATE_TRUNC('${timelineInterval}', created_at)
-        ORDER BY date
-      `, [startDate]);
-
-      return {
-        total_events: Number(totalEvents.rows[0]?.total || 0),
-        unique_users: Number(uniqueUsers.rows[0]?.unique_users || 0),
-        events_by_action: eventsByAction.rows.reduce((acc: any, row: any) => {
-          acc[row.action] = Number(row.count);
-          return acc;
-        }, {}),
-        events_by_resource: eventsByResource.rows.reduce((acc: any, row: any) => {
-          acc[row.resource_type] = Number(row.count);
-          return acc;
-        }, {}),
-        timeline: timeline.rows.map((row: any) => ({
-          date: row.date,
-          count: Number(row.count),
-        })),
-      };
-    } catch (error) {
-      logger.error('Failed to get audit stats:', error);
-      throw error;
-    }
-  }
-
-  /**
-   * Search audit logs
-   */
-  async searchAuditLogs(searchTerm: string, filters: {
-    user_id?: string;
-    resource_type?: string;
-    date_from?: Date;
-    date_to?: Date;
-    limit?: number;
-  } = {}): Promise<any[]> {
-    try {
-      const masterDb = databaseService.getMasterDb();
-
-      let query = `
-        SELECT * FROM audit_logs 
-        WHERE (
-          action ILIKE $1 OR 
-          resource_type ILIKE $1 OR 
-          resource_id ILIKE $1 OR
-          details::text ILIKE $1
+      // Check for multiple failed logins from same IP
+      const failedLoginsByIP = await masterDb
+        .select({
+          ip_address: masterSchema.auditLogs.ip_address,
+          count: sql<number>`cast(count(*) as int)`,
+        })
+        .from(masterSchema.auditLogs)
+        .where(
+          and(
+            gte(masterSchema.auditLogs.timestamp, lastHour),
+            eq(masterSchema.auditLogs.action, 'failed_login'),
+            sql`ip_address IS NOT NULL`
+          )
         )
-      `;
-      
-      const params: any[] = [`%${searchTerm}%`];
-      let paramIndex = 2;
+        .groupBy(masterSchema.auditLogs.ip_address)
+        .having(sql`count(*) >= 5`);
 
-      if (filters.user_id) {
-        query += ` AND user_id = $${paramIndex}`;
-        params.push(filters.user_id);
-        paramIndex++;
-      }
+      failedLoginsByIP.forEach(({ ip_address, count }) => {
+        alerts.push({
+          type: 'brute_force_attempt',
+          severity: count >= 10 ? 'critical' : 'high',
+          message: `Multiple failed login attempts from IP: ${ip_address}`,
+          count,
+          details: { ip_address },
+        });
+      });
 
-      if (filters.resource_type) {
-        query += ` AND resource_type = $${paramIndex}`;
-        params.push(filters.resource_type);
-        paramIndex++;
-      }
+      // Check for unusual data access patterns
+      const highVolumeUsers = await masterDb
+        .select({
+          user_id: masterSchema.auditLogs.user_id,
+          count: sql<number>`cast(count(*) as int)`,
+        })
+        .from(masterSchema.auditLogs)
+        .where(
+          and(
+            gte(masterSchema.auditLogs.timestamp, lastHour),
+            eq(masterSchema.auditLogs.category, 'data'),
+            sql`user_id IS NOT NULL`
+          )
+        )
+        .groupBy(masterSchema.auditLogs.user_id)
+        .having(sql`count(*) >= 100`);
 
-      if (filters.date_from) {
-        query += ` AND created_at >= $${paramIndex}`;
-        params.push(filters.date_from);
-        paramIndex++;
-      }
+      highVolumeUsers.forEach(({ user_id, count }) => {
+        alerts.push({
+          type: 'unusual_data_access',
+          severity: 'medium',
+          message: `High volume data access by user: ${user_id}`,
+          count,
+          details: { user_id },
+        });
+      });
 
-      if (filters.date_to) {
-        query += ` AND created_at <= $${paramIndex}`;
-        params.push(filters.date_to);
-        paramIndex++;
-      }
-
-      query += ` ORDER BY created_at DESC`;
-
-      if (filters.limit) {
-        query += ` LIMIT $${paramIndex}`;
-        params.push(filters.limit);
-      }
-
-      const result = await masterDb.execute(query, params);
-      return result.rows;
+      return { alerts };
     } catch (error) {
-      logger.error('Failed to search audit logs:', error);
-      throw error;
+      logger.error('Failed to check security alerts:', error);
+      return { alerts: [] };
     }
   }
 
   /**
-   * Start batch processor
-   */
-  private startBatchProcessor(): void {
-    this.flushTimer = setInterval(async () => {
-      if (this.auditQueue.length > 0) {
-        await this.flushBatch();
-      }
-    }, this.flushInterval);
-  }
-
-  /**
-   * Flush current batch to database
-   */
-  private async flushBatch(): Promise<void> {
-    if (this.auditQueue.length === 0) {
-      return;
-    }
-
-    const batch = this.auditQueue.splice(0, this.batchSize);
-    
-    try {
-      const masterDb = databaseService.getMasterDb();
-      
-      // Insert batch
-      await masterDb
-        .insert(masterSchema.auditLogs)
-        .values(batch);
-
-      logger.debug(`Flushed ${batch.length} audit events to database`);
-    } catch (error) {
-      logger.error('Failed to flush audit batch:', error);
-      
-      // Re-queue failed events (with limit to prevent memory issues)
-      if (this.auditQueue.length < 1000) {
-        this.auditQueue.unshift(...batch);
-      }
-    }
-  }
-
-  /**
-   * Enable/disable audit logging
-   */
-  setEnabled(enabled: boolean): void {
-    this.isEnabled = enabled;
-    logger.info(`Audit logging ${enabled ? 'enabled' : 'disabled'}`);
-  }
-
-  /**
-   * Get audit service status
-   */
-  getStatus(): {
-    enabled: boolean;
-    queue_size: number;
-    batch_size: number;
-    flush_interval: number;
-  } {
-    return {
-      enabled: this.isEnabled,
-      queue_size: this.auditQueue.length,
-      batch_size: this.batchSize,
-      flush_interval: this.flushInterval,
-    };
-  }
-
-  /**
-   * Cleanup old audit logs
-   */
-  async cleanup(retentionDays: number = 90): Promise<number> {
-    try {
-      const masterDb = databaseService.getMasterDb();
-      const cutoffDate = new Date();
-      cutoffDate.setDate(cutoffDate.getDate() - retentionDays);
-
-      const result = await masterDb.execute(`
-        DELETE FROM audit_logs 
-        WHERE created_at < $1
-      `, [cutoffDate]);
-
-      const deletedCount = result.rowCount || 0;
-      
-      logger.info(`Cleaned up ${deletedCount} old audit logs older than ${retentionDays} days`);
-      return deletedCount;
-    } catch (error) {
-      logger.error('Failed to cleanup audit logs:', error);
-      throw error;
-    }
-  }
-
-  /**
-   * Graceful shutdown
+   * Cleanup and shutdown
    */
   async shutdown(): Promise<void> {
     try {
-      logger.info('Shutting down audit service...');
-      
-      // Stop the flush timer
-      if (this.flushTimer) {
-        clearInterval(this.flushTimer);
-        this.flushTimer = null;
+      if (this.batchInterval) {
+        clearInterval(this.batchInterval);
       }
 
-      // Flush remaining events
-      if (this.auditQueue.length > 0) {
-        await this.flushBatch();
-      }
+      // Flush remaining entries
+      await this.flushBatch();
 
       logger.info('Audit service shutdown completed');
     } catch (error) {
       logger.error('Error during audit service shutdown:', error);
     }
   }
+
+  /**
+   * Get service status
+   */
+  getStatus(): {
+    batchSize: number;
+    pendingEntries: number;
+    isProcessing: boolean;
+  } {
+    return {
+      batchSize: this.BATCH_SIZE,
+      pendingEntries: this.batchEntries.length,
+      isProcessing: !!this.batchInterval,
+    };
+  }
 }
 
 // Export singleton instance
 export const auditService = new AuditService();
+
+export default auditService;

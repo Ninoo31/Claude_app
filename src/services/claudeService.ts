@@ -1,379 +1,807 @@
-import { config } from '@/config/environment';
+import axios, { AxiosInstance } from 'axios';
+import { Config, claudeConfig } from '@/config/environment';
 import { logger } from '@/utils/logger';
+import { createError } from '@/middleware/errorHandler';
 
 /**
- * Enhanced Claude Service
- * Integrates with n8n workflow to communicate with Claude API
- * Handles message routing, response processing, and error handling
+ * Claude AI Service
+ * Handles integration with Anthropic's Claude API
  */
+
+var config: Config = claudeConfig;
+
+interface ClaudeMessage {
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+}
+
+interface ClaudeResponse {
+  id: string;
+  type: 'message';
+  role: 'assistant';
+  content: Array<{
+    type: 'text';
+    text: string;
+  }>;
+  model: string;
+  stop_reason: string;
+  stop_sequence: string | null;
+  usage: {
+    input_tokens: number;
+    output_tokens: number;
+  };
+}
+
+interface ClaudeRequestOptions {
+  model?: string;
+  max_tokens?: number;
+  temperature?: number;
+  top_p?: number;
+  system?: string;
+  stream?: boolean;
+}
+
+interface RateLimitInfo {
+  requestsPerMinute: number;
+  tokensPerMinute: number;
+  currentRequests: number;
+  currentTokens: number;
+  resetTime: number;
+}
+
+interface ConversationContext {
+  messages: ClaudeMessage[];
+  systemPrompt?: string;
+  userId: string;
+  conversationId: string;
+}
+
 class ClaudeService {
-  private requestQueue: Map<string, Promise<any>> = new Map();
-  private rateLimitTracker: Map<string, { count: number; resetTime: number }> = new Map();
+  private client: AxiosInstance;
+  private rateLimits: Map<string, RateLimitInfo> = new Map();
+  private readonly DEFAULT_MODEL = claudeConfig.model;
+  private readonly DEFAULT_MAX_TOKENS = claudeConfig.maxTokens;
+  private readonly DEFAULT_TEMPERATURE = claudeConfig.temperature;
+
+  constructor() {
+    if (!claudeConfig.apiKey) {
+      logger.warn('Claude API key not configured - Claude integration disabled');
+      throw new Error('Claude API key not configured');
+    }
+
+    this.client = axios.create({
+      baseURL: claudeConfig.apiUrl,
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': claudeConfig.apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      timeout: 60000, // 60 seconds
+    });
+
+    // Request interceptor for logging
+    this.client.interceptors.request.use(
+      (config) => {
+        logger.debug('Claude API request:', {
+          url: config.url,
+          method: config.method,
+          model: config.data?.model,
+          maxTokens: config.data?.max_tokens,
+        });
+        return config;
+      },
+      (error) => {
+        logger.error('Claude API request error:', error);
+        return Promise.reject(error);
+      }
+    );
+
+    // Response interceptor for logging and error handling
+    this.client.interceptors.response.use(
+      (response) => {
+        logger.debug('Claude API response:', {
+          status: response.status,
+          model: response.data?.model,
+          usage: response.data?.usage,
+        });
+        return response;
+      },
+      (error) => {
+        logger.error('Claude API error:', {
+          status: error.response?.status,
+          data: error.response?.data,
+          message: error.message,
+        });
+        return Promise.reject(this.handleApiError(error));
+      }
+    );
+
+    logger.info('Claude service initialized');
+  }
 
   /**
-   * Send message to Claude via n8n workflow with enhanced error handling and rate limiting
-   * @param request - Message request data
+   * Send a message to Claude and get response
    */
-  async sendMessage(request: {
-    user_id: string;
-    conversation_id: string;
-    user_message: string;
-    importance_level: number;
-    conversation_context?: {
-      title: string;
-      summary?: string | null;
-      recent_messages: Array<{
-        role: string;
-        content: string;
-        created_at: string | Date;
-      }>;
-    };
-  }): Promise<{
+  async sendMessage(
+    context: ConversationContext,
+    newMessage: string,
+    options: ClaudeRequestOptions = {}
+  ): Promise<{
     response: string;
-    tokens_used?: number;
-    model_used?: string;
-    processing_time_ms?: number;
-    metadata?: Record<string, any>;
+    usage: {
+      inputTokens: number;
+      outputTokens: number;
+      totalTokens: number;
+    };
+    model: string;
+    processingTime: number;
   }> {
-    const requestKey = `${request.user_id}:${request.conversation_id}`;
-    
+    const startTime = Date.now();
+
     try {
-      // Check rate limiting
-      await this.checkRateLimit(request.user_id);
+      // Check rate limits
+      await this.checkRateLimit(context.userId);
 
-      // Prevent duplicate requests
-      if (this.requestQueue.has(requestKey)) {
-        logger.debug(`Request already in progress for ${requestKey}, waiting...`);
-        return await this.requestQueue.get(requestKey)!;
-      }
+      // Prepare messages
+      const messages = [
+        ...context.messages,
+        { role: 'user' as const, content: newMessage },
+      ];
 
-      // Create and queue the request
-      const requestPromise = this.executeClaudeRequest(request);
-      this.requestQueue.set(requestKey, requestPromise);
+      // Build request payload
+      const payload = {
+        model: options.model || this.DEFAULT_MODEL,
+        max_tokens: options.max_tokens || this.DEFAULT_MAX_TOKENS,
+        temperature: options.temperature || this.DEFAULT_TEMPERATURE,
+        top_p: options.top_p || claudeConfig.topP,
+        messages,
+        system: options.system || context.systemPrompt,
+      };
 
-      try {
-        const result = await requestPromise;
-        return result;
-      } finally {
-        this.requestQueue.delete(requestKey);
-      }
+      // Make API call
+      const response = await this.client.post<ClaudeResponse>('/messages', payload);
+      const processingTime = Date.now() - startTime;
+
+      // Extract response text
+      const responseText = response.data.content
+        .filter(item => item.type === 'text')
+        .map(item => item.text)
+        .join('');
+
+      // Update rate limits
+      this.updateRateLimit(context.userId, response.data.usage);
+
+      // Log successful completion
+      logger.info('Claude message processed', {
+        userId: context.userId,
+        conversationId: context.conversationId,
+        model: response.data.model,
+        inputTokens: response.data.usage.input_tokens,
+        outputTokens: response.data.usage.output_tokens,
+        processingTime,
+      });
+
+      return {
+        response: responseText,
+        usage: {
+          inputTokens: response.data.usage.input_tokens,
+          outputTokens: response.data.usage.output_tokens,
+          totalTokens: response.data.usage.input_tokens + response.data.usage.output_tokens,
+        },
+        model: response.data.model,
+        processingTime,
+      };
     } catch (error) {
-      this.requestQueue.delete(requestKey);
+      const processingTime = Date.now() - startTime;
+      
+      logger.error('Claude message failed:', {
+        userId: context.userId,
+        conversationId: context.conversationId,
+        error: error.message,
+        processingTime,
+      });
+
       throw error;
     }
   }
 
   /**
-   * Execute the actual Claude request
-   * @param request - Request data
+   * Generate a conversation summary
    */
-  private async executeClaudeRequest(request: any): Promise<any> {
+  async generateSummary(
+    messages: ClaudeMessage[],
+    userId: string,
+    options: { maxLength?: number } = {}
+  ): Promise<string> {
+    try {
+      const { maxLength = 200 } = options;
+
+      // Create summary prompt
+      const summaryPrompt = `Please provide a concise summary of this conversation in ${maxLength} characters or less. Focus on the main topics discussed and key outcomes.`;
+
+      const context: ConversationContext = {
+        messages,
+        systemPrompt: summaryPrompt,
+        userId,
+        conversationId: 'summary-generation',
+      };
+
+      const result = await this.sendMessage(context, 'Generate summary', {
+        max_tokens: Math.min(500, maxLength * 2), // Estimate tokens needed
+        temperature: 0.3, // Lower temperature for more consistent summaries
+      });
+
+      return result.response.trim();
+    } catch (error) {
+      logger.error('Summary generation failed:', error);
+      throw createError.externalService('Claude', 'Failed to generate summary');
+    }
+  }
+
+  /**
+   * Analyze conversation sentiment
+   */
+  async analyzeSentiment(
+    messages: ClaudeMessage[],
+    userId: string
+  ): Promise<{
+    sentiment: 'positive' | 'negative' | 'neutral';
+    confidence: number;
+    reasoning: string;
+  }> {
+    try {
+      const sentimentPrompt = `Analyze the sentiment of this conversation and respond with a JSON object containing:
+      - sentiment: "positive", "negative", or "neutral"
+      - confidence: a number between 0 and 1
+      - reasoning: a brief explanation of your assessment`;
+
+      const context: ConversationContext = {
+        messages,
+        systemPrompt: sentimentPrompt,
+        userId,
+        conversationId: 'sentiment-analysis',
+      };
+
+      const result = await this.sendMessage(context, 'Analyze sentiment', {
+        max_tokens: 300,
+        temperature: 0.1,
+      });
+
+      try {
+        const analysis = JSON.parse(result.response);
+        return {
+          sentiment: analysis.sentiment,
+          confidence: Math.max(0, Math.min(1, analysis.confidence)),
+          reasoning: analysis.reasoning || 'No reasoning provided',
+        };
+      } catch (parseError) {
+        logger.warn('Failed to parse sentiment analysis JSON:', parseError);
+        return {
+          sentiment: 'neutral',
+          confidence: 0.5,
+          reasoning: 'Unable to parse sentiment analysis',
+        };
+      }
+    } catch (error) {
+      logger.error('Sentiment analysis failed:', error);
+      throw createError.externalService('Claude', 'Failed to analyze sentiment');
+    }
+  }
+
+  /**
+   * Extract topics from conversation
+   */
+  async extractTopics(
+    messages: ClaudeMessage[],
+    userId: string,
+    maxTopics: number = 5
+  ): Promise<string[]> {
+    try {
+      const topicsPrompt = `Extract the main topics discussed in this conversation. Return a JSON array of topic strings (max ${maxTopics} topics).`;
+
+      const context: ConversationContext = {
+        messages,
+        systemPrompt: topicsPrompt,
+        userId,
+        conversationId: 'topic-extraction',
+      };
+
+      const result = await this.sendMessage(context, 'Extract topics', {
+        max_tokens: 200,
+        temperature: 0.2,
+      });
+
+      try {
+        const topics = JSON.parse(result.response);
+        return Array.isArray(topics) ? topics.slice(0, maxTopics) : [];
+      } catch (parseError) {
+        logger.warn('Failed to parse topics JSON:', parseError);
+        return [];
+      }
+    } catch (error) {
+      logger.error('Topic extraction failed:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Check if a message is appropriate
+   */
+  async moderateContent(content: string, userId: string): Promise<{
+    approved: boolean;
+    reason?: string;
+    confidence: number;
+  }> {
+    try {
+      const moderationPrompt = `Review this message for inappropriate content including hate speech, violence, illegal activities, or harassment. Respond with JSON:
+      - approved: true/false
+      - reason: explanation if not approved
+      - confidence: number between 0 and 1`;
+
+      const context: ConversationContext = {
+        messages: [],
+        systemPrompt: moderationPrompt,
+        userId,
+        conversationId: 'content-moderation',
+      };
+
+      const result = await this.sendMessage(context, content, {
+        max_tokens: 200,
+        temperature: 0.1,
+      });
+
+      try {
+        const moderation = JSON.parse(result.response);
+        return {
+          approved: Boolean(moderation.approved),
+          reason: moderation.reason,
+          confidence: Math.max(0, Math.min(1, moderation.confidence || 0.5)),
+        };
+      } catch (parseError) {
+        logger.warn('Failed to parse moderation JSON:', parseError);
+        // Default to approved if we can't parse the response
+        return { approved: true, confidence: 0.5 };
+      }
+    } catch (error) {
+      logger.error('Content moderation failed:', error);
+      // Default to approved if moderation fails
+      return { approved: true, confidence: 0.5 };
+    }
+  }
+
+  /**
+   * Get available models
+   */
+  async getAvailableModels(): Promise<string[]> {
+    try {
+      // Since Anthropic doesn't have a models endpoint, return known models
+      return [
+        'claude-3-opus-20240229',
+        'claude-3-sonnet-20240229',
+        'claude-3-haiku-20240307',
+        'claude-2.1',
+        'claude-2.0',
+        'claude-instant-1.2',
+      ];
+    } catch (error) {
+      logger.error('Failed to get available models:', error);
+      return [this.DEFAULT_MODEL];
+    }
+  }
+
+  /**
+   * Check API health
+   */
+  async healthCheck(): Promise<{
+    healthy: boolean;
+    latency: number;
+    error?: string;
+  }> {
     const startTime = Date.now();
 
     try {
-      // Prepare the enhanced request payload
-      const payload = {
-        ...request,
-        timestamp: new Date().toISOString(),
-        client_info: {
-          version: '1.0.0',
-          platform: 'claude-memory-backend'
-        }
-      };
-
-      // Call n8n webhook
-      const response = await fetch(config.n8n.webhookUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'User-Agent': 'Claude-Memory-Backend/1.0.0',
-          ...(config.n8n.apiKey && { 'Authorization': `Bearer ${config.n8n.apiKey}` })
-        },
-        body: JSON.stringify(payload),
-        timeout: 30000, // 30 second timeout
+      // Simple health check with minimal token usage
+      const response = await this.client.post('/messages', {
+        model: 'claude-3-haiku-20240307', // Use fastest model for health check
+        max_tokens: 10,
+        messages: [{ role: 'user', content: 'ping' }],
       });
 
-      if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`n8n webhook failed: ${response.status} ${response.statusText} - ${errorText}`);
-      }
-
-      const data = await response.json();
-      const processingTime = Date.now() - startTime;
-
-      // Validate response structure
-      if (!data.claude_response && !data.response) {
-        throw new Error('Invalid response format: missing claude_response or response field');
-      }
-
-      // Update rate limit tracking
-      this.updateRateLimit(request.user_id);
-
-      logger.debug(`Claude response received in ${processingTime}ms for user ${request.user_id}`);
+      const latency = Date.now() - startTime;
 
       return {
-        response: data.claude_response || data.response || 'No response received',
-        tokens_used: data.tokens_used || data.token_count,
-        model_used: data.model_used || data.model || 'claude-sonnet-4',
-        processing_time_ms: processingTime,
-        metadata: {
-          n8n_response_time: processingTime,
-          workflow_data: data,
-          request_timestamp: payload.timestamp,
-        },
+        healthy: response.status === 200,
+        latency,
       };
+    } catch (error) {
+      const latency = Date.now() - startTime;
+      
+      return {
+        healthy: false,
+        latency,
+        error: error.message,
+      };
+    }
+  }
+
+  /**
+   * Rate limiting management
+   */
+  private async checkRateLimit(userId: string): Promise<void> {
+    const limit = this.getRateLimit(userId);
+    const now = Date.now();
+
+    // Reset counters if window has passed
+    if (now > limit.resetTime) {
+      limit.currentRequests = 0;
+      limit.currentTokens = 0;
+      limit.resetTime = now + 60000; // Reset every minute
+    }
+
+    // Check request limit
+    if (limit.currentRequests >= limit.requestsPerMinute) {
+      throw createError.rateLimit('Claude API request limit exceeded');
+    }
+
+    // Increment request counter
+    limit.currentRequests++;
+  }
+
+  private updateRateLimit(userId: string, usage: { input_tokens: number; output_tokens: number }): void {
+    const limit = this.getRateLimit(userId);
+    limit.currentTokens += usage.input_tokens + usage.output_tokens;
+
+    // Check token limit
+    if (limit.currentTokens >= limit.tokensPerMinute) {
+      logger.warn('Claude API token limit approaching', {
+        userId,
+        currentTokens: limit.currentTokens,
+        tokenLimit: limit.tokensPerMinute,
+      });
+    }
+  }
+
+  private getRateLimit(userId: string): RateLimitInfo {
+    if (!this.rateLimits.has(userId)) {
+      this.rateLimits.set(userId, {
+        requestsPerMinute: 50, // Conservative default
+        tokensPerMinute: 40000, // Conservative default
+        currentRequests: 0,
+        currentTokens: 0,
+        resetTime: Date.now() + 60000,
+      });
+    }
+
+    return this.rateLimits.get(userId)!;
+  }
+
+  /**
+   * Clean up expired rate limit entries
+   */
+  public cleanupRateLimits(): void {
+    const now = Date.now();
+    const expired: string[] = [];
+
+    for (const [userId, limit] of this.rateLimits.entries()) {
+      // Remove entries that haven't been used in over an hour
+      if (now > limit.resetTime + 3600000) {
+        expired.push(userId);
+      }
+    }
+
+    expired.forEach(userId => this.rateLimits.delete(userId));
+
+    if (expired.length > 0) {
+      logger.debug(`Cleaned up ${expired.length} expired rate limit entries`);
+    }
+  }
+
+  /**
+   * Get rate limit status for a user
+   */
+  public getRateLimitStatus(userId: string): RateLimitInfo {
+    return { ...this.getRateLimit(userId) };
+  }
+
+  /**
+   * Error handling
+   */
+  private handleApiError(error: any): Error {
+    if (!error.response) {
+      return createError.externalService('Claude', 'Network error');
+    }
+
+    const { status, data } = error.response;
+
+    switch (status) {
+      case 400:
+        return createError.custom(
+          data.error?.message || 'Invalid request to Claude API',
+          400,
+          'CLAUDE_BAD_REQUEST'
+        );
+      case 401:
+        return createError.custom(
+          'Invalid Claude API key',
+          401,
+          'CLAUDE_UNAUTHORIZED'
+        );
+      case 403:
+        return createError.custom(
+          'Claude API access forbidden',
+          403,
+          'CLAUDE_FORBIDDEN'
+        );
+      case 429:
+        return createError.rateLimit('Claude API rate limit exceeded');
+      case 500:
+        return createError.externalService('Claude', 'Claude API server error');
+      case 529:
+        return createError.externalService('Claude', 'Claude API overloaded');
+      default:
+        return createError.externalService(
+          'Claude',
+          `Unexpected API error: ${status}`
+        );
+    }
+  }
+
+  /**
+   * Token estimation
+   */
+  public estimateTokens(text: string): number {
+    // Rough estimation: ~4 characters per token for English text
+    return Math.ceil(text.length / 4);
+  }
+
+  /**
+   * Calculate cost estimation
+   */
+  public estimateCost(
+    inputTokens: number,
+    outputTokens: number,
+    model: string = this.DEFAULT_MODEL
+  ): number {
+    // Pricing as of 2024 (in USD per 1M tokens)
+    const pricing: { [key: string]: { input: number; output: number } } = {
+      'claude-3-opus-20240229': { input: 15, output: 75 },
+      'claude-3-sonnet-20240229': { input: 3, output: 15 },
+      'claude-3-haiku-20240307': { input: 0.25, output: 1.25 },
+      'claude-2.1': { input: 8, output: 24 },
+      'claude-2.0': { input: 8, output: 24 },
+      'claude-instant-1.2': { input: 0.8, output: 2.4 },
+    };
+
+    const modelPricing = pricing[model] || pricing[this.DEFAULT_MODEL];
+    
+    const inputCost = (inputTokens / 1000000) * modelPricing.input;
+    const outputCost = (outputTokens / 1000000) * modelPricing.output;
+
+    return inputCost + outputCost;
+  }
+
+  /**
+   * Stream support for real-time responses
+   */
+  async sendMessageStream(
+    context: ConversationContext,
+    newMessage: string,
+    onChunk: (chunk: string) => void,
+    options: ClaudeRequestOptions = {}
+  ): Promise<{
+    fullResponse: string;
+    usage: {
+      inputTokens: number;
+      outputTokens: number;
+      totalTokens: number;
+    };
+    model: string;
+    processingTime: number;
+  }> {
+    const startTime = Date.now();
+
+    try {
+      // Check rate limits
+      await this.checkRateLimit(context.userId);
+
+      // Prepare messages
+      const messages = [
+        ...context.messages,
+        { role: 'user' as const, content: newMessage },
+      ];
+
+      // Build request payload
+      const payload = {
+        model: options.model || this.DEFAULT_MODEL,
+        max_tokens: options.max_tokens || this.DEFAULT_MAX_TOKENS,
+        temperature: options.temperature || this.DEFAULT_TEMPERATURE,
+        top_p: options.top_p || claudeConfig.topP,
+        messages,
+        system: options.system || context.systemPrompt,
+        stream: true,
+      };
+
+      let fullResponse = '';
+      let usage = { input_tokens: 0, output_tokens: 0 };
+      let model = payload.model;
+
+      const response = await this.client.post('/messages', payload, {
+        responseType: 'stream',
+      });
+
+      return new Promise((resolve, reject) => {
+        response.data.on('data', (chunk: Buffer) => {
+          const lines = chunk.toString().split('\n');
+          
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              try {
+                const data = JSON.parse(line.slice(6));
+                
+                if (data.type === 'content_block_delta') {
+                  const text = data.delta?.text || '';
+                  fullResponse += text;
+                  onChunk(text);
+                } else if (data.type === 'message_stop') {
+                  usage = data.usage || usage;
+                  model = data.model || model;
+                }
+              } catch (parseError) {
+                // Ignore parsing errors for non-JSON lines
+              }
+            }
+          }
+        });
+
+        response.data.on('end', () => {
+          const processingTime = Date.now() - startTime;
+          
+          // Update rate limits
+          this.updateRateLimit(context.userId, usage);
+
+          resolve({
+            fullResponse,
+            usage: {
+              inputTokens: usage.input_tokens,
+              outputTokens: usage.output_tokens,
+              totalTokens: usage.input_tokens + usage.output_tokens,
+            },
+            model,
+            processingTime,
+          });
+        });
+
+        response.data.on('error', (error: Error) => {
+          reject(this.handleApiError(error));
+        });
+      });
     } catch (error) {
       const processingTime = Date.now() - startTime;
       
-      logger.error('Failed to send message to Claude:', {
+      logger.error('Claude streaming failed:', {
+        userId: context.userId,
+        conversationId: context.conversationId,
         error: error.message,
-        user_id: request.user_id,
-        conversation_id: request.conversation_id,
-        processing_time: processingTime
+        processingTime,
       });
 
-      // Determine if this is a retryable error
-      if (this.isRetryableError(error)) {
-        logger.info(`Retryable error detected, will retry for user ${request.user_id}`);
-        throw new Error(`Claude service temporarily unavailable: ${error.message}`);
-      } else {
-        throw new Error(`Claude service error: ${error.message}`);
-      }
+      throw error;
     }
   }
 
   /**
-   * Check rate limiting for user
-   * @param userId - User ID
+   * Batch processing for multiple messages
    */
-  private async checkRateLimit(userId: string): Promise<void> {
-    const now = Date.now();
-    const userLimit = this.rateLimitTracker.get(userId);
-
-    if (userLimit) {
-      if (now < userLimit.resetTime) {
-        if (userLimit.count >= 60) { // 60 requests per minute max
-          throw new Error('Rate limit exceeded. Please wait before sending another message.');
-        }
-      } else {
-        // Reset counter after time window
-        this.rateLimitTracker.set(userId, { count: 0, resetTime: now + 60000 });
-      }
-    } else {
-      // First request for this user
-      this.rateLimitTracker.set(userId, { count: 0, resetTime: now + 60000 });
-    }
-  }
-
-  /**
-   * Update rate limit tracking after successful request
-   * @param userId - User ID
-   */
-  private updateRateLimit(userId: string): void {
-    const userLimit = this.rateLimitTracker.get(userId);
-    if (userLimit) {
-      userLimit.count += 1;
-    }
-  }
-
-  /**
-   * Determine if an error is retryable
-   * @param error - Error object
-   */
-  private isRetryableError(error: any): boolean {
-    // Network errors, timeouts, and 5xx HTTP errors are typically retryable
-    return (
-      error.code === 'ECONNRESET' ||
-      error.code === 'ETIMEDOUT' ||
-      error.code === 'ENOTFOUND' ||
-      error.message.includes('timeout') ||
-      error.message.includes('5') // 5xx HTTP errors
-    );
-  }
-
-  /**
-   * Test Claude service connectivity with detailed diagnostics
-   */
-  async testConnection(): Promise<{
+  async sendBatchMessages(
+    contexts: ConversationContext[],
+    messages: string[],
+    options: ClaudeRequestOptions = {}
+  ): Promise<Array<{
     success: boolean;
-    response_time: number;
-    error?: string;
-    details: {
-      webhook_url: string;
-      has_api_key: boolean;
-      test_timestamp: string;
+    response?: string;
+    usage?: {
+      inputTokens: number;
+      outputTokens: number;
+      totalTokens: number;
     };
-  }> {
-    const startTime = Date.now();
-    const testTimestamp = new Date().toISOString();
-
-    try {
-      const testResponse = await this.sendMessage({
-        user_id: 'health_check',
-        conversation_id: 'connectivity_test',
-        user_message: 'Hello, this is a connectivity test. Please respond with a simple acknowledgment.',
-        importance_level: 1,
-        conversation_context: {
-          title: 'Health Check',
-          recent_messages: []
-        }
-      });
-
-      const responseTime = Date.now() - startTime;
-
-      return {
-        success: true,
-        response_time: responseTime,
-        details: {
-          webhook_url: config.n8n.webhookUrl,
-          has_api_key: !!config.n8n.apiKey,
-          test_timestamp: testTimestamp,
-        },
-      };
-    } catch (error: any) {
-      const responseTime = Date.now() - startTime;
-      
-      return {
-        success: false,
-        response_time: responseTime,
-        error: error.message,
-        details: {
-          webhook_url: config.n8n.webhookUrl,
-          has_api_key: !!config.n8n.apiKey,
-          test_timestamp: testTimestamp,
-        },
-      };
+    error?: string;
+  }>> {
+    if (contexts.length !== messages.length) {
+      throw createError.custom(
+        'Contexts and messages arrays must have the same length',
+        400,
+        'BATCH_LENGTH_MISMATCH'
+      );
     }
+
+    const results = await Promise.allSettled(
+      contexts.map((context, index) =>
+        this.sendMessage(context, messages[index], options)
+      )
+    );
+
+    return results.map(result => {
+      if (result.status === 'fulfilled') {
+        return {
+          success: true,
+          response: result.value.response,
+          usage: result.value.usage,
+        };
+      } else {
+        return {
+          success: false,
+          error: result.reason.message,
+        };
+      }
+    });
   }
 
   /**
-   * Get service health metrics
+   * Get service statistics
    */
-  getServiceMetrics(): {
-    active_requests: number;
-    rate_limited_users: number;
-    total_tracked_users: number;
+  public getStatistics(): {
+    totalUsers: number;
+    totalRequests: number;
+    totalTokens: number;
+    averageLatency: number;
   } {
-    const now = Date.now();
-    let rateLimitedUsers = 0;
+    let totalRequests = 0;
+    let totalTokens = 0;
 
-    for (const [userId, limit] of this.rateLimitTracker.entries()) {
-      if (now < limit.resetTime && limit.count >= 60) {
-        rateLimitedUsers++;
-      }
+    for (const limit of this.rateLimits.values()) {
+      totalRequests += limit.currentRequests;
+      totalTokens += limit.currentTokens;
     }
 
     return {
-      active_requests: this.requestQueue.size,
-      rate_limited_users: rateLimitedUsers,
-      total_tracked_users: this.rateLimitTracker.size,
+      totalUsers: this.rateLimits.size,
+      totalRequests,
+      totalTokens,
+      averageLatency: 0, // Would need to track this separately
     };
   }
 
   /**
-   * Clear rate limit for a specific user (admin function)
-   * @param userId - User ID
+   * Validate model availability
    */
-  clearRateLimit(userId: string): void {
-    this.rateLimitTracker.delete(userId);
-    logger.info(`Rate limit cleared for user ${userId}`);
+  public isModelAvailable(model: string): boolean {
+    const availableModels = [
+      'claude-3-opus-20240229',
+      'claude-3-sonnet-20240229',
+      'claude-3-haiku-20240307',
+      'claude-2.1',
+      'claude-2.0',
+      'claude-instant-1.2',
+    ];
+
+    return availableModels.includes(model);
   }
 
   /**
-   * Clean up expired rate limit entries (call periodically)
+   * Get optimal model recommendation
    */
-  cleanupRateLimits(): void {
-    const now = Date.now();
-    let cleaned = 0;
+  public recommendModel(
+    requirements: {
+      speed?: 'fast' | 'balanced' | 'thorough';
+      complexity?: 'simple' | 'moderate' | 'complex';
+      budget?: 'low' | 'medium' | 'high';
+    }
+  ): string {
+    const { speed = 'balanced', complexity = 'moderate', budget = 'medium' } = requirements;
 
-    for (const [userId, limit] of this.rateLimitTracker.entries()) {
-      if (now > limit.resetTime + 300000) { // 5 minutes after reset time
-        this.rateLimitTracker.delete(userId);
-        cleaned++;
-      }
+    if (speed === 'fast' || budget === 'low') {
+      return 'claude-3-haiku-20240307';
     }
 
-    if (cleaned > 0) {
-      logger.debug(`Cleaned up ${cleaned} expired rate limit entries`);
-    }
-  }
-
-  /**
-   * Send a batch of messages (for import/migration scenarios)
-   * @param requests - Array of message requests
-   * @param options - Batch processing options
-   */
-  async sendMessageBatch(
-    requests: Array<{
-      user_id: string;
-      conversation_id: string;
-      user_message: string;
-      importance_level: number;
-      conversation_context?: any;
-    }>,
-    options: {
-      max_concurrent: number;
-      delay_between_batches: number;
-    } = { max_concurrent: 5, delay_between_batches: 1000 }
-  ): Promise<Array<{
-    success: boolean;
-    request_index: number;
-    response?: any;
-    error?: string;
-  }>> {
-    const results: Array<{
-      success: boolean;
-      request_index: number;
-      response?: any;
-      error?: string;
-    }> = [];
-
-    // Process requests in batches
-    for (let i = 0; i < requests.length; i += options.max_concurrent) {
-      const batch = requests.slice(i, i + options.max_concurrent);
-      
-      const batchPromises = batch.map(async (request, batchIndex) => {
-        const requestIndex = i + batchIndex;
-        try {
-          const response = await this.sendMessage(request);
-          return {
-            success: true,
-            request_index: requestIndex,
-            response,
-          };
-        } catch (error: any) {
-          return {
-            success: false,
-            request_index: requestIndex,
-            error: error.message,
-          };
-        }
-      });
-
-      const batchResults = await Promise.allSettled(batchPromises);
-      
-      for (const result of batchResults) {
-        if (result.status === 'fulfilled') {
-          results.push(result.value);
-        } else {
-          results.push({
-            success: false,
-            request_index: i + results.length,
-            error: result.reason?.message || 'Unknown error',
-          });
-        }
-      }
-
-      // Delay between batches to avoid overwhelming the service
-      if (i + options.max_concurrent < requests.length) {
-        await new Promise(resolve => setTimeout(resolve, options.delay_between_batches));
-      }
-
-      logger.info(`Processed batch ${Math.floor(i / options.max_concurrent) + 1}/${Math.ceil(requests.length / options.max_concurrent)}`);
+    if (complexity === 'complex' && budget === 'high') {
+      return 'claude-3-opus-20240229';
     }
 
-    return results;
+    return 'claude-3-sonnet-20240229'; // Default balanced option
   }
 }
 
+// Export singleton instance
 export const claudeService = new ClaudeService();
+
+export default claudeService;
