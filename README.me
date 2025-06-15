@@ -1,0 +1,420 @@
+# Claude Memory Backend
+
+[![Node.js](https://img.shields.io/badge/Node.js-18%2B-green.svg)](https://nodejs.org/)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.3-blue.svg)](https://www.typescriptlang.org/)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-14%2B-blue.svg)](https://www.postgresql.org/)
+[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+Multi-tenant AI conversation platform backend with per-user database isolation. Provides a robust API for managing AI conversations, projects, and user data with Claude AI integration.
+
+## 🌟 Features
+
+- **Multi-tenant Architecture**: Isolated data per user with flexible database configurations
+- **Claude AI Integration**: Seamless integration with Claude via n8n workflows
+- **Real-time Communication**: WebSocket support for live conversations
+- **Project Management**: Organize conversations into projects with collaboration features
+- **Data Export/Import**: Comprehensive data portability with multiple formats
+- **Audit Logging**: Complete audit trail for security and compliance
+- **Webhook Support**: Extensible webhook system for integrations
+- **Database Flexibility**: Support for local and cloud database configurations
+- **Security First**: JWT authentication, rate limiting, and data encryption
+- **Monitoring Ready**: Health checks and metrics for production deployment
+
+## 🏗️ Architecture
+
+```
+┌─────────────────┐    ┌──────────────────┐    ┌─────────────────┐
+│   Frontend      │    │   Backend API    │    │   Claude AI     │
+│   (React)       │◄──►│   (Express.js)   │◄──►│   (via n8n)     │
+└─────────────────┘    └──────────────────┘    └─────────────────┘
+                              │
+                              ▼
+                    ┌──────────────────┐
+                    │  Master Database │
+                    │   (PostgreSQL)   │
+                    └──────────────────┘
+                              │
+                              ▼
+                    ┌──────────────────┐
+                    │ Tenant Databases │
+                    │ (Per-user data)  │
+                    └──────────────────┘
+```
+
+## 🚀 Quick Start
+
+### Prerequisites
+
+- Node.js 18+ and npm 9+
+- PostgreSQL 14+
+- Claude AI access (via Anthropic API or n8n)
+
+### Installation
+
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/your-org/claude-memory-backend.git
+   cd claude-memory-backend
+   ```
+
+2. **Install dependencies**
+   ```bash
+   npm install
+   ```
+
+3. **Setup environment**
+   ```bash
+   cp .env.example .env
+   # Edit .env with your configuration
+   ```
+
+4. **Setup database**
+   ```bash
+   # Create PostgreSQL database
+   createdb claude_memory_master
+   
+   # Run migrations
+   npm run db:migrate
+   ```
+
+5. **Start development server**
+   ```bash
+   npm run dev
+   ```
+
+The API will be available at `http://localhost:3001`
+
+## ⚙️ Configuration
+
+### Environment Variables
+
+| Variable | Description | Required | Default |
+|----------|-------------|----------|---------|
+| `NODE_ENV` | Environment (development/production) | No | development |
+| `PORT` | Server port | No | 3001 |
+| `JWT_SECRET` | JWT signing secret (32+ characters) | Yes | - |
+| `MASTER_DATABASE_URL` | PostgreSQL connection string | Yes | - |
+| `N8N_WEBHOOK_URL` | n8n webhook endpoint for Claude | Yes | - |
+| `ANTHROPIC_API_KEY` | Direct Anthropic API key | Optional | - |
+| `STORAGE_PATH` | File storage directory | No | ./storage |
+| `ALLOWED_ORIGINS` | CORS allowed origins | No | http://localhost:3000 |
+
+See `.env.example` for complete configuration options.
+
+### Database Setup
+
+The application uses a multi-tenant architecture:
+
+1. **Master Database**: Stores user accounts, authentication, and database configurations
+2. **Tenant Databases**: Per-user data isolation (conversations, projects, etc.)
+
+```bash
+# Generate database migrations
+npm run db:generate
+
+# Apply migrations
+npm run db:migrate
+
+# Seed development data
+npm run db:seed
+
+# Open database studio
+npm run db:studio
+```
+
+## 📚 API Documentation
+
+### Authentication
+
+All protected endpoints require JWT authentication:
+
+```bash
+Authorization: Bearer <your-jwt-token>
+```
+
+### Core Endpoints
+
+#### Authentication
+- `POST /api/v1/auth/register` - Register new user
+- `POST /api/v1/auth/login` - User login
+- `POST /api/v1/auth/refresh` - Refresh token
+- `GET /api/v1/auth/profile` - Get user profile
+
+#### Projects
+- `GET /api/v1/projects` - List user projects
+- `POST /api/v1/projects` - Create project
+- `GET /api/v1/projects/:id` - Get project details
+- `PUT /api/v1/projects/:id` - Update project
+- `DELETE /api/v1/projects/:id` - Delete project
+
+#### Conversations
+- `GET /api/v1/conversations` - List conversations
+- `POST /api/v1/conversations` - Create conversation
+- `GET /api/v1/conversations/:id` - Get conversation
+- `POST /api/v1/conversations/:id/messages` - Send message
+- `GET /api/v1/conversations/search` - Search conversations
+
+#### Database Management
+- `GET /api/v1/database` - List database configurations
+- `POST /api/v1/database` - Add database configuration
+- `POST /api/v1/database/test` - Test database connection
+
+#### Export/Import
+- `POST /api/v1/export/create` - Create export job
+- `GET /api/v1/export/download/:jobId` - Download export
+- `POST /api/v1/export/import` - Import data
+
+### API Documentation
+
+When running in development mode, full API documentation is available at:
+```
+http://localhost:3001/api/docs
+```
+
+## 🔧 Development
+
+### Scripts
+
+```bash
+# Development
+npm run dev              # Start development server with hot reload
+npm run build            # Build for production
+npm run start            # Start production server
+
+# Database
+npm run db:generate      # Generate migrations from schema changes
+npm run db:migrate       # Run pending migrations
+npm run db:seed          # Seed development data
+npm run db:studio        # Open Drizzle Studio
+
+# Testing
+npm test                 # Run tests
+npm run test:watch       # Run tests in watch mode
+npm run test:coverage    # Run tests with coverage
+
+# Code Quality
+npm run lint             # Lint code
+npm run lint:fix         # Fix linting issues
+```
+
+### Project Structure
+
+```
+src/
+├── config/              # Configuration files
+│   ├── environment.ts   # Environment variables
+│   └── swagger.ts       # API documentation
+├── controllers/         # Route controllers
+│   ├── authController.ts
+│   ├── projectController.ts
+│   └── conversationController.ts
+├── database/           # Database layer
+│   ├── schemas/        # Drizzle ORM schemas
+│   └── migrations/     # Database migrations
+├── middleware/         # Express middleware
+│   ├── authMiddleware.ts
+│   └── errorHandler.ts
+├── routes/            # API routes
+├── services/          # Business logic
+│   ├── authService.ts
+│   ├── databaseService.ts
+│   ├── claudeService.ts
+│   └── conversationService.ts
+├── types/             # TypeScript type definitions
+├── utils/             # Utility functions
+└── server.ts          # Application entry point
+```
+
+## 🔐 Security
+
+### Authentication & Authorization
+- JWT-based authentication with refresh tokens
+- Role-based access control (RBAC)
+- Session management with automatic cleanup
+- Secure HTTP-only cookies
+
+### Data Protection
+- Per-user database isolation
+- Encryption for sensitive data exports
+- Input validation and sanitization
+- SQL injection protection via Drizzle ORM
+
+### API Security
+- Rate limiting per user/IP
+- CORS configuration
+- Security headers (Helmet.js)
+- Request size limits
+
+## 🚀 Deployment
+
+### Docker Deployment
+
+```bash
+# Build image
+docker build -t claude-memory-backend .
+
+# Run with environment
+docker run -p 3001:3001 --env-file .env claude-memory-backend
+```
+
+### Production Checklist
+
+- [ ] Set `NODE_ENV=production`
+- [ ] Use strong JWT secrets (32+ characters)
+- [ ] Configure production database
+- [ ] Set up SSL/TLS termination
+- [ ] Configure reverse proxy (nginx)
+- [ ] Set up log aggregation
+- [ ] Configure monitoring and alerts
+- [ ] Enable database backups
+- [ ] Set up CI/CD pipeline
+
+### Environment-specific Configs
+
+```bash
+# Development
+NODE_ENV=development
+LOG_LEVEL=debug
+
+# Production
+NODE_ENV=production
+LOG_LEVEL=warn
+```
+
+## 📊 Monitoring
+
+### Health Checks
+
+```bash
+# Basic health
+GET /api/v1/health
+
+# Detailed health with dependencies
+GET /api/v1/health/detailed
+
+# Kubernetes probes
+GET /api/v1/health/readiness
+GET /api/v1/health/liveness
+```
+
+### Metrics
+
+```bash
+# Application metrics
+GET /api/v1/health/metrics
+
+# System information
+GET /api/v1/health/info
+```
+
+### Logging
+
+Structured logging with Winston:
+- Console output in development
+- File output in production
+- JSON format for log aggregation
+- Configurable log levels
+
+## 🔌 Integrations
+
+### Claude AI via n8n
+
+Configure n8n workflow:
+1. Create webhook trigger
+2. Add Claude API call
+3. Return structured response
+4. Set webhook URL in environment
+
+### Direct Anthropic Integration
+
+Alternative to n8n:
+```bash
+ANTHROPIC_API_KEY=sk-ant-your-key-here
+```
+
+### WebSocket Real-time
+
+```javascript
+const ws = new WebSocket('ws://localhost:3001/ws?token=your-jwt-token');
+
+// Join conversation room
+ws.send(JSON.stringify({
+  type: 'join_room',
+  data: { room_id: 'conv_123' }
+}));
+
+// Send typing indicator
+ws.send(JSON.stringify({
+  type: 'typing',
+  data: { room_id: 'conv_123', is_typing: true }
+}));
+```
+
+## 🐛 Troubleshooting
+
+### Common Issues
+
+**Database Connection Failed**
+```bash
+# Check PostgreSQL is running
+sudo systemctl status postgresql
+
+# Verify connection string
+psql "postgresql://username:password@localhost:5432/claude_memory_master"
+```
+
+**JWT Token Invalid**
+- Check JWT_SECRET is set and consistent
+- Verify token hasn't expired
+- Check system clock synchronization
+
+**n8n Webhook Not Responding**
+- Verify n8n is running and accessible
+- Check webhook URL is correct
+- Test webhook with curl
+
+**WebSocket Connection Failed**
+- Check JWT token in query parameters
+- Verify CORS settings
+- Check firewall/proxy configuration
+
+### Debug Mode
+
+Enable detailed logging:
+```bash
+LOG_LEVEL=debug npm run dev
+```
+
+## 🤝 Contributing
+
+1. Fork the repository
+2. Create feature branch: `git checkout -b feature/amazing-feature`
+3. Commit changes: `git commit -m 'Add amazing feature'`
+4. Push to branch: `git push origin feature/amazing-feature`
+5. Open Pull Request
+
+### Development Guidelines
+
+- Follow TypeScript strict mode
+- Write tests for new features
+- Update documentation
+- Use conventional commits
+- Ensure all tests pass
+
+## 📄 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## 🙏 Acknowledgments
+
+- [Claude AI](https://www.anthropic.com/) - AI conversation capabilities
+- [Drizzle ORM](https://orm.drizzle.team/) - Type-safe database access
+- [Express.js](https://expressjs.com/) - Web framework
+- [n8n](https://n8n.io/) - Workflow automation
+
+## 📞 Support
+
+- 📧 Email: support@your-domain.com
+- 📖 Documentation: [docs.your-domain.com](https://docs.your-domain.com)
+- 🐛 Issues: [GitHub Issues](https://github.com/your-org/claude-memory-backend/issues)
+- 💬 Discussions: [GitHub Discussions](https://github.com/your-org/claude-memory-backend/discussions)
